@@ -94,8 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_timestamp
 CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name
     ON tool_call_records(tool_name);
 
-CREATE INDEX IF NOT EXISTS idx_tool_calls_chain
-    ON tool_call_records(namespace, timestamp, id);
+-- idx_tool_calls_chain is created in _migrate_v5() (after _migrate_v4 renames user_id→namespace)
 
 -- ------------------------------------------------------------------ --
 -- Idempotency + extraction job tracking                               --
