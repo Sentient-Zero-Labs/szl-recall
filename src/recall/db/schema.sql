@@ -1,7 +1,7 @@
 -- Recall SQLite schema
--- Version: 1 (Tools series baseline)
+-- Version: 5 (v0.4 — hash-chained audit trail for Article 12 compliance)
 -- Apply with: aiosqlite execute_script() on first startup
--- Postgres migration: Memory series Issue 01
+-- Existing DBs: _migrate_v5() in connection.py adds hash-chain columns via ALTER TABLE
 
 -- ------------------------------------------------------------------ --
 -- Schema version tracking                                             --
@@ -62,7 +62,10 @@ CREATE TABLE IF NOT EXISTS tool_call_records (
     llm_tokens_in   INTEGER DEFAULT 0,
     llm_tokens_out  INTEGER DEFAULT 0,
     cost_usd        REAL DEFAULT 0.0,
-    timestamp       TEXT NOT NULL
+    timestamp       TEXT NOT NULL,
+    prev_hash       TEXT,                      -- row_hash of previous record in this namespace
+    row_hash        TEXT,                      -- SHA256(prev_hash||tool_name||timestamp||inputs_hash)
+    exported_at     TEXT                       -- ISO8601 set when exported to S3 Object Lock
 );
 
 -- ------------------------------------------------------------------ --
@@ -90,6 +93,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_timestamp
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name
     ON tool_call_records(tool_name);
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_chain
+    ON tool_call_records(namespace, timestamp, id);
 
 -- ------------------------------------------------------------------ --
 -- Idempotency + extraction job tracking                               --
@@ -143,3 +149,21 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_a2a_user ON a2a_tasks(namespace);
+
+-- ------------------------------------------------------------------ --
+-- Eval scores (v6 — score_response LLM-judge tool)                   --
+-- ------------------------------------------------------------------ --
+
+CREATE TABLE IF NOT EXISTS eval_scores (
+    id          TEXT PRIMARY KEY,
+    namespace   TEXT NOT NULL,
+    session_id  TEXT,
+    query       TEXT,
+    response    TEXT,
+    score       REAL,
+    reasoning   TEXT,
+    timestamp   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_scores_namespace
+    ON eval_scores(namespace, timestamp);

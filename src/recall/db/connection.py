@@ -67,6 +67,30 @@ async def _migrate_v3(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+_V5_COLUMNS = [
+    ("tool_call_records", "prev_hash",   "TEXT"),
+    ("tool_call_records", "row_hash",    "TEXT"),
+    ("tool_call_records", "exported_at", "TEXT"),
+]
+
+
+async def _migrate_v5(db: aiosqlite.Connection) -> None:
+    """Add hash-chain columns to tool_call_records (v5 — Article 12 tamper evidence)."""
+    for table, col, coltype in _V5_COLUMNS:
+        try:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass  # column already exists
+    try:
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_calls_chain "
+            "ON tool_call_records(namespace, timestamp, id)"
+        )
+    except Exception:
+        pass
+    await db.commit()
+
+
 async def _migrate_v4(db: aiosqlite.Connection) -> None:
     """Rename user_id → namespace across all tables (v4 — SQLite 3.25+ RENAME COLUMN)."""
     renames = [
@@ -90,6 +114,30 @@ async def _migrate_v4(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_v6(db: aiosqlite.Connection) -> None:
+    """Create eval_scores table for score_response LLM-judge tool (v6)."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS eval_scores (
+            id          TEXT PRIMARY KEY,
+            namespace   TEXT NOT NULL,
+            session_id  TEXT,
+            query       TEXT,
+            response    TEXT,
+            score       REAL,
+            reasoning   TEXT,
+            timestamp   TEXT NOT NULL
+        )"""
+    )
+    try:
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eval_scores_namespace "
+            "ON eval_scores(namespace, timestamp)"
+        )
+    except Exception:
+        pass
+    await db.commit()
+
+
 async def _init_sqlite() -> None:
     schema = _SCHEMA_PATH.read_text()
     async with aiosqlite.connect(_DB_PATH) as db:
@@ -104,6 +152,8 @@ async def _init_sqlite() -> None:
         await _migrate_v2(db)
         await _migrate_v3(db)
         await _migrate_v4(db)
+        await _migrate_v5(db)
+        await _migrate_v6(db)
 
 
 async def _init_postgres() -> None:
@@ -130,6 +180,18 @@ async def _init_postgres() -> None:
             if not clean:
                 continue
             await db.execute(clean)
+        await db.commit()
+
+    # Apply v5 hash-chain columns to existing Postgres deployments.
+    # Safe no-op on fresh deployments (schema.sql already includes the columns).
+    async with get_backend() as db:
+        for _table, col, coltype in _V5_COLUMNS:
+            try:
+                await db.execute(
+                    f"ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS {col} {coltype}"
+                )
+            except Exception:
+                pass
         await db.commit()
 
 

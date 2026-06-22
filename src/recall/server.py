@@ -23,7 +23,8 @@ from starlette.responses import JSONResponse
 from recall.db.backend import close_pg_pool, get_backend
 from recall.db.connection import init_db
 from recall.decay import DecayWorker
-from recall.logging import LoggingMiddleware
+from recall.export_worker import ExportWorker
+from recall.logging import SENTINEL_HASH, LoggingMiddleware, compute_row_hash
 from recall.security import hash_token, validate_tool_descriptions
 from recall.worker import ExtractionWorker
 
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 namespace_ctx: ContextVar[str] = ContextVar("namespace", default="")
 extraction_worker: ExtractionWorker | None = None
 decay_worker: DecayWorker | None = None
+export_worker: ExportWorker | None = None
 
 _VALID_MEMORY_TYPES = frozenset({"preference", "fact", "decision", "procedure"})
 
@@ -80,19 +82,23 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
-    global extraction_worker, decay_worker
+    global extraction_worker, decay_worker, export_worker
     await init_db()
     _validate_server_descriptions()
     extraction_worker = ExtractionWorker()
     await extraction_worker.start()
     decay_worker = DecayWorker()
     await decay_worker.start()
+    export_worker = ExportWorker()
+    await export_worker.start()
     await _recover_orphaned_operations()
     yield
     if extraction_worker:
         await extraction_worker.stop()
     if decay_worker:
         await decay_worker.stop()
+    if export_worker:
+        await export_worker.stop()
     await close_pg_pool()
 
 
@@ -116,6 +122,8 @@ def _validate_server_descriptions() -> None:
     tool_functions = [
         store_memory, search_memories, inspect_memories,
         delete_memory, get_memory_stats, consolidate_memories,
+        verify_audit_chain, export_compliance_report, get_cost_summary,
+        trigger_audit_export, score_response,
     ]
     descriptions = {
         f.__name__: (f.__doc__ or "").split("\n")[0].strip()
@@ -456,6 +464,302 @@ async def delete_namespace_data(confirm: str) -> dict:
     return {
         "status": "ok",
         "data": {"tokens_revoked": tokens_revoked},
+        "error": None,
+    }
+
+
+@mcp.tool()
+async def verify_audit_chain(
+    start_id: str = "",
+    end_id: str = "",
+) -> dict:
+    """Verify the tamper-evident hash chain for the current namespace's audit records.
+
+    Returns status 'ok' if the chain is intact, 'broken' if any record was modified.
+    Optionally restrict verification to a range with start_id / end_id.
+    """
+    namespace = namespace_ctx.get()
+
+    async with get_backend() as db:
+        rows = await db.fetch_all(
+            "SELECT id, tool_name, timestamp, inputs_hash, prev_hash, row_hash "
+            "FROM tool_call_records WHERE namespace = ? "
+            "ORDER BY timestamp ASC, id ASC",
+            (namespace,),
+        )
+
+    # Filter to start/end range if specified
+    if start_id or end_id:
+        ids = [r[0] for r in rows]
+        s = ids.index(start_id) if start_id and start_id in ids else 0
+        e = ids.index(end_id) + 1 if end_id and end_id in ids else len(rows)
+        rows = rows[s:e]
+
+    pre_chain = len([r for r in rows if r[5] is None])
+    chained = [r for r in rows if r[5] is not None]
+
+    if not chained:
+        return {
+            "status": "ok",
+            "data": {
+                "status": "ok",
+                "records_checked": 0,
+                "pre_chain_records": pre_chain,
+                "first_record": None,
+                "last_record": None,
+                "broken_at": None,
+                "message": "No hash-chained records yet. Records predate v0.4.",
+            },
+            "error": None,
+        }
+
+    expected_prev = SENTINEL_HASH
+    broken_at: str | None = None
+    checked = 0
+
+    for row_id, tool_name, timestamp, inputs_hash, prev_hash, row_hash in chained:
+        if prev_hash != expected_prev:
+            broken_at = row_id
+            break
+        expected_hash = compute_row_hash(prev_hash, tool_name, timestamp, inputs_hash)
+        if row_hash != expected_hash:
+            broken_at = row_id
+            break
+        expected_prev = row_hash
+        checked += 1
+
+    result_status = "broken" if broken_at else "ok"
+    return {
+        "status": "ok",
+        "data": {
+            "status": result_status,
+            "records_checked": checked,
+            "pre_chain_records": pre_chain,
+            "first_record": chained[0][0],
+            "last_record": chained[-1][0],
+            "broken_at": broken_at,
+            "message": (
+                f"Chain integrity verified across {checked} records."
+                if result_status == "ok"
+                else f"Chain broken at record {broken_at}. Records after this point are unverifiable."
+            ),
+        },
+        "error": None,
+    }
+
+
+@mcp.tool()
+async def export_compliance_report(
+    from_date: str = "",
+    to_date: str = "",
+) -> dict:
+    """Export audit records as NDJSON for the current namespace.
+
+    from_date / to_date: ISO8601 date strings (e.g. '2026-01-01'). Empty = no bound.
+    Returns NDJSON of all tool_call_records in the range — suitable for regulatory inspection.
+    """
+    namespace = namespace_ctx.get()
+
+    conditions = ["namespace = ?"]
+    params: list = [namespace]
+    if from_date:
+        conditions.append("timestamp >= ?")
+        params.append(from_date)
+    if to_date:
+        tail = to_date + "T23:59:59" if "T" not in to_date else to_date
+        conditions.append("timestamp <= ?")
+        params.append(tail)
+
+    where = " AND ".join(conditions)
+    async with get_backend() as db:
+        rows = await db.fetch_all(
+            f"SELECT id, tool_name, session_id, inputs_hash, status, error_code, "
+            f"duration_ms, llm_tokens_in, llm_tokens_out, cost_usd, timestamp, prev_hash, row_hash "
+            f"FROM tool_call_records WHERE {where} ORDER BY timestamp ASC, id ASC",
+            tuple(params),
+        )
+
+    records = [
+        {
+            "id": r[0], "tool_name": r[1], "namespace": namespace,
+            "session_id": r[2], "inputs_hash": r[3], "status": r[4],
+            "error_code": r[5], "duration_ms": r[6],
+            "llm_tokens_in": r[7], "llm_tokens_out": r[8], "cost_usd": r[9],
+            "timestamp": r[10], "prev_hash": r[11], "row_hash": r[12],
+        }
+        for r in rows
+    ]
+    ndjson = "\n".join(json.dumps(rec) for rec in records)
+
+    return {
+        "status": "ok",
+        "data": {
+            "record_count": len(records),
+            "from_date": from_date or None,
+            "to_date": to_date or None,
+            "ndjson": ndjson,
+        },
+        "error": None,
+    }
+
+
+@mcp.tool()
+async def get_cost_summary(
+    session_id: str = "",
+    from_date: str = "",
+    to_date: str = "",
+) -> dict:
+    """Return LLM cost breakdown grouped by session.
+
+    Pass session_id to filter to a single n8n workflow execution.
+    from_date / to_date: ISO8601 date strings (e.g. '2026-01-01'). Empty = no bound.
+    """
+    namespace = namespace_ctx.get()
+
+    conditions = ["namespace = ?"]
+    params: list = [namespace]
+    if session_id:
+        conditions.append("session_id = ?")
+        params.append(session_id)
+    if from_date:
+        conditions.append("timestamp >= ?")
+        params.append(from_date)
+    if to_date:
+        tail = to_date + "T23:59:59" if "T" not in to_date else to_date
+        conditions.append("timestamp <= ?")
+        params.append(tail)
+
+    where = " AND ".join(conditions)
+    async with get_backend() as db:
+        rows = await db.fetch_all(
+            f"SELECT session_id, tool_name, llm_tokens_in, llm_tokens_out, cost_usd, timestamp "
+            f"FROM tool_call_records WHERE {where} ORDER BY timestamp ASC",
+            tuple(params),
+        )
+
+    sessions: dict[str, dict] = {}
+    for sid_raw, tool_name, tokens_in, tokens_out, cost, ts in rows:
+        sid = sid_raw or "unknown"
+        if sid not in sessions:
+            sessions[sid] = {
+                "session_id": sid,
+                "tool_calls": 0,
+                "llm_tokens_in": 0,
+                "llm_tokens_out": 0,
+                "cost_usd": 0.0,
+                "first_call": ts,
+                "last_call": ts,
+                "tools_used": [],
+            }
+        s = sessions[sid]
+        s["tool_calls"] += 1
+        s["llm_tokens_in"] += tokens_in or 0
+        s["llm_tokens_out"] += tokens_out or 0
+        s["cost_usd"] = round(s["cost_usd"] + (cost or 0.0), 6)
+        s["last_call"] = ts
+        if tool_name not in s["tools_used"]:
+            s["tools_used"].append(tool_name)
+
+    session_list = sorted(sessions.values(), key=lambda x: x["first_call"])
+    return {
+        "status": "ok",
+        "data": {
+            "sessions": session_list,
+            "total_cost_usd": round(sum(s["cost_usd"] for s in session_list), 6),
+            "total_tool_calls": sum(s["tool_calls"] for s in session_list),
+        },
+        "error": None,
+    }
+
+
+@mcp.tool()
+async def trigger_audit_export() -> dict:
+    """Trigger an immediate export of unexported audit records to S3/R2 Object Lock.
+
+    Requires RECALL_EXPORT_BUCKET, RECALL_EXPORT_AWS_KEY, RECALL_EXPORT_AWS_SECRET.
+    Returns a summary of files uploaded and records exported.
+    """
+    if export_worker is None or not export_worker.enabled:
+        return {
+            "status": "error",
+            "error": (
+                "Export not configured. "
+                "Set RECALL_EXPORT_BUCKET, RECALL_EXPORT_AWS_KEY, RECALL_EXPORT_AWS_SECRET."
+            ),
+            "code": "EXPORT_NOT_CONFIGURED",
+        }
+    summary = await export_worker.export_pending()
+    return {"status": "ok", "data": summary, "error": None}
+
+
+_SCORE_PROMPT = """\
+You are an evaluator. Given a query, a response, and optional retrieved context, \
+score how faithfully the response answers the query using ONLY information in the context.
+
+Query: {query}
+Response: {response}
+Context: {context}
+
+Return ONLY valid JSON: {{"score": 0.0-1.0, "reasoning": "one sentence", "issues": []}}
+Score 1.0 = fully faithful, 0.0 = completely hallucinated."""
+
+
+@mcp.tool()
+async def score_response(
+    query: str,
+    response: str,
+    context_used: str = "",
+    session_id: str = "",
+) -> dict:
+    """Score a response for faithfulness to retrieved context using Claude Haiku as judge.
+
+    Returns a score (0.0-1.0), reasoning, and a list of faithfulness issues found.
+    Useful in n8n workflows to measure memory retrieval quality per execution.
+    Requires ANTHROPIC_API_KEY.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {"status": "error", "error": "ANTHROPIC_API_KEY not set.", "code": "NO_API_KEY"}
+
+    namespace = namespace_ctx.get()
+    prompt = _SCORE_PROMPT.format(
+        query=query,
+        response=response,
+        context=context_used or "(none provided)",
+    )
+
+    llm_client = anthropic.AsyncAnthropic(api_key=api_key)
+    try:
+        msg = await llm_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, IndexError) as exc:
+        return {"status": "error", "error": f"LLM returned unparseable output: {exc}", "code": "PARSE_ERROR"}
+    finally:
+        await llm_client.close()
+
+    score = max(0.0, min(1.0, float(result.get("score", 0.0))))
+    reasoning = str(result.get("reasoning", ""))
+    issues: list[str] = [str(i) for i in result.get("issues", [])]
+    now = datetime.now(timezone.utc).isoformat()
+
+    async with get_backend() as db:
+        await db.execute(
+            "INSERT INTO eval_scores (id, namespace, session_id, query, response, score, reasoning, timestamp) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), namespace, session_id or "", query, response, score, reasoning, now),
+        )
+        await db.commit()
+
+    return {
+        "status": "ok",
+        "data": {"score": score, "reasoning": reasoning, "issues": issues},
         "error": None,
     }
 

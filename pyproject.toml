@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "szl-recall"
-version = "0.3.9"
-description = "Persistent memory layer for AI agents. Local-first. Inspectable. Framework-agnostic."
+version = "0.4.0"
+description = "EU AI Act Article 12 compliant agent audit infrastructure — with persistent memory built in."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Sentient Zero Labs" }]
@@ -29,6 +29,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+export = [
+    "aioboto3>=12.0",
+]
 postgres = [
     "asyncpg>=0.29",
     "pgvector>=0.3",

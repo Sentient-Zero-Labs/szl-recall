@@ -31,8 +31,11 @@ htmlcov/
 .vscode/
 *.swp
 
-# Docs research files (content notes, not code)
+# Internal planning and research files (local only, not for git)
 docs/
+PLAN_v0.3.md
+build-research.md
+RESEARCH.md
 
 # Environment
 .env

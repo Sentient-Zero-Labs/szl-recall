@@ -20,6 +20,9 @@ session_id_ctx: ContextVar[str] = ContextVar("session_id", default="")
 token_in_ctx: ContextVar[int] = ContextVar("token_in", default=0)
 token_out_ctx: ContextVar[int] = ContextVar("token_out", default=0)
 
+# First record in a namespace uses SHA256(b"\x00") as the genesis prev_hash.
+SENTINEL_HASH: str = hashlib.sha256(b"\x00").hexdigest()
+
 _MODEL_RATES: dict[str, tuple[float, float]] = {
     "claude-sonnet": (3.00 / 1_000_000, 15.00 / 1_000_000),
     "claude-haiku": (0.25 / 1_000_000, 1.25 / 1_000_000),
@@ -55,13 +58,35 @@ def hash_inputs(inputs: Any) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()[:16]
 
 
+def compute_row_hash(prev_hash: str, tool_name: str, timestamp_iso: str, inputs_hash: str) -> str:
+    """SHA256 of concatenated fields — any field change breaks every downstream hash."""
+    payload = f"{prev_hash}{tool_name}{timestamp_iso}{inputs_hash}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+async def _fetch_prev_hash(namespace: str) -> str:
+    """Return row_hash of the most recent record for this namespace, or SENTINEL_HASH."""
+    async with get_backend() as db:
+        row = await db.fetch_one(
+            "SELECT row_hash FROM tool_call_records "
+            "WHERE namespace = ? AND row_hash IS NOT NULL "
+            "ORDER BY timestamp DESC, id DESC LIMIT 1",
+            (namespace,),
+        )
+    return row[0] if row else SENTINEL_HASH
+
+
 async def insert_tool_call_record(record: ToolCallRecord) -> None:
+    timestamp_iso = record.timestamp.isoformat()
+    prev_hash = await _fetch_prev_hash(record.namespace)
+    row_hash = compute_row_hash(prev_hash, record.tool_name, timestamp_iso, record.inputs_hash)
     async with get_backend() as db:
         await db.execute(
             """INSERT INTO tool_call_records
                (id, tool_name, namespace, session_id, inputs_hash, status, error_code,
-                duration_ms, llm_tokens_in, llm_tokens_out, cost_usd, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                duration_ms, llm_tokens_in, llm_tokens_out, cost_usd, timestamp,
+                prev_hash, row_hash)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.id,
                 record.tool_name,
@@ -74,7 +99,9 @@ async def insert_tool_call_record(record: ToolCallRecord) -> None:
                 record.llm_tokens_in,
                 record.llm_tokens_out,
                 record.cost_usd,
-                record.timestamp.isoformat(),
+                timestamp_iso,
+                prev_hash,
+                row_hash,
             ),
         )
         await db.commit()
