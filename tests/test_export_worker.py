@@ -238,8 +238,8 @@ class TestExportPending:
         lines = [l for l in body.strip().split("\n") if l]
         assert len(lines) == 3
 
-    async def test_uses_object_lock_compliance_mode(self, client, namespace):
-        """Uploaded objects must use COMPLIANCE mode and a retention date."""
+    async def test_upload_does_not_send_object_lock_headers(self, client, namespace):
+        """put_object must not include S3 Object Lock headers — R2 returns NotImplemented."""
         past = datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
         await insert_tool_call_record(_make_record(namespace, ts=past))
 
@@ -247,7 +247,6 @@ class TestExportPending:
             "RECALL_EXPORT_BUCKET": "test-bucket",
             "RECALL_EXPORT_AWS_KEY": "key",
             "RECALL_EXPORT_AWS_SECRET": "secret",
-            "RECALL_EXPORT_RETENTION_DAYS": "2557",
         }
         with patch.dict("os.environ", env):
             w = ExportWorker()
@@ -263,5 +262,6 @@ class TestExportPending:
                 await w.export_pending()
 
         call_kwargs = mock_s3.put_object.call_args.kwargs
-        assert call_kwargs["ObjectLockMode"] == "COMPLIANCE"
-        assert call_kwargs["ObjectLockRetainUntilDate"] is not None
+        assert "ObjectLockMode" not in call_kwargs
+        assert "ObjectLockRetainUntilDate" not in call_kwargs
+        assert call_kwargs["ContentType"] == "application/x-ndjson"

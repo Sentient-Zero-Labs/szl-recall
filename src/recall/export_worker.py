@@ -1,8 +1,15 @@
-"""S3/R2 Object Lock export worker — nightly NDJSON export of tool_call_records.
+"""S3/R2 WORM export worker — nightly NDJSON export of tool_call_records.
 
-Uploads unexported audit records to an S3-compatible bucket configured with Object
-Lock (WORM). Once written, records cannot be deleted or modified for the retention
-period — satisfying EU AI Act Article 12's immutable storage requirement.
+Uploads unexported audit records to an S3-compatible bucket configured for
+immutable retention, satisfying EU AI Act Article 12's tamper-evident storage
+requirement.
+
+For Cloudflare R2: apply bucket-level lock rules via wrangler before use —
+  wrangler r2 bucket lock add <bucket> --name 7-year-compliance --retention-days 2557
+R2 does not support S3 per-object lock headers (returns NotImplemented).
+
+For AWS S3: enable Object Lock on the bucket and optionally set a default
+retention policy. Per-object lock can be set here if needed.
 
 Configuration (env vars):
   RECALL_EXPORT_BUCKET         Required. S3/R2 bucket name. Unset = export disabled.
@@ -10,13 +17,10 @@ Configuration (env vars):
                                 R2: https://<account_id>.r2.cloudflarestorage.com
   RECALL_EXPORT_AWS_KEY        AWS/R2 access key ID.
   RECALL_EXPORT_AWS_SECRET     AWS/R2 secret access key.
-  RECALL_EXPORT_AWS_REGION     AWS region (default: us-east-1). R2: auto.
-  RECALL_EXPORT_RETENTION_DAYS Object Lock retention in days (default: 2557 = 7 years).
+  RECALL_EXPORT_AWS_REGION     AWS region (default: us-east-1). R2: ignored.
 
 S3 key format:
   {namespace}/{YYYY-MM-DD}.ndjson
-
-Object Lock mode: COMPLIANCE — immutable even for the bucket owner.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import json
 import logging
 import os
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from recall.db.backend import get_backend
 
@@ -60,7 +64,6 @@ class ExportWorker:
         self._aws_key = os.environ.get("RECALL_EXPORT_AWS_KEY")
         self._aws_secret = os.environ.get("RECALL_EXPORT_AWS_SECRET")
         self._region = os.environ.get("RECALL_EXPORT_AWS_REGION", "us-east-1")
-        self._retention_days = int(os.environ.get("RECALL_EXPORT_RETENTION_DAYS", "2557"))
         self._task: asyncio.Task | None = None
 
     @property
@@ -157,8 +160,6 @@ class ExportWorker:
             region_name=self._region,
         )
 
-        retain_until = datetime.now(timezone.utc) + timedelta(days=self._retention_days)
-
         async with session.client(
             "s3",
             endpoint_url=self._endpoint_url,
@@ -174,8 +175,6 @@ class ExportWorker:
                         Key=s3_key,
                         Body=ndjson.encode(),
                         ContentType="application/x-ndjson",
-                        ObjectLockMode="COMPLIANCE",
-                        ObjectLockRetainUntilDate=retain_until,
                     )
                 except Exception as exc:
                     err = f"{ns}/{date}: {exc}"

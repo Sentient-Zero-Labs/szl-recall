@@ -7,7 +7,16 @@ import asyncio
 import sys
 
 
+def _load_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed — env must be set externally
+
+
 def main() -> None:
+    _load_dotenv()
     parser = argparse.ArgumentParser(
         prog="recall",
         description="Recall — persistent memory layer for AI agents.",

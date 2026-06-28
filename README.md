@@ -59,7 +59,7 @@ Recall fills that gap. The compliance features are the product. The memory is in
 |---|---|
 | Automatic logging | `tool_call_records` — every MCP tool call logged with tool name, namespace, duration, tokens, cost |
 | Tamper-evident | Hash-chained audit trail: each record includes `SHA256(prev_hash \|\| tool_name \|\| timestamp \|\| inputs_hash)`. Modifying any field breaks every hash from that point forward. |
-| Immutable storage | `trigger_audit_export` uploads records to S3/R2 with Object Lock (COMPLIANCE mode, 7-year retention). Immutable even for the bucket owner. |
+| Immutable storage | `trigger_audit_export` uploads records to S3/R2. For Cloudflare R2: retention is enforced via bucket-level lock rules (`wrangler r2 bucket lock add --retention-days 2557`). For AWS S3: bucket Object Lock + COMPLIANCE mode. |
 | Verify integrity | `verify_audit_chain` walks the hash chain and returns a signed integrity report. |
 | Export for regulators | `export_compliance_report` returns NDJSON of all records in a date range. |
 
@@ -173,9 +173,10 @@ SQLite (default) / Postgres (RECALL_DB_URL)
    operations            extraction job queue
 
                                        ▼
-                          S3/R2 with Object Lock (WORM)
+                          S3/R2 with WORM retention
                           {namespace}/{YYYY-MM-DD}.ndjson
-                          COMPLIANCE mode, 7-year retention
+                          R2: bucket lock rules (wrangler)
+                          S3: Object Lock COMPLIANCE mode
 ```
 
 **Hash chain invariant:**
@@ -239,8 +240,7 @@ pip install "szl-recall[export]"
 | `RECALL_EXPORT_ENDPOINT_URL` | — | Custom endpoint for Cloudflare R2: `https://<account>.r2.cloudflarestorage.com` |
 | `RECALL_EXPORT_AWS_KEY` | — | S3/R2 access key ID |
 | `RECALL_EXPORT_AWS_SECRET` | — | S3/R2 secret access key |
-| `RECALL_EXPORT_AWS_REGION` | `us-east-1` | AWS region (R2: auto) |
-| `RECALL_EXPORT_RETENTION_DAYS` | `2557` | Object Lock retention in days (2557 = 7 years) |
+| `RECALL_EXPORT_AWS_REGION` | `us-east-1` | AWS region (R2: not used) |
 
 ### Tuning
 
