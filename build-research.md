@@ -159,7 +159,7 @@ from contextvars import ContextVar
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
-user_ctx: ContextVar[str | None] = ContextVar("user_id", default=None)
+namespace_ctx: ContextVar[str | None] = ContextVar("namespace", default=None)
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, secret_key: str):
@@ -176,11 +176,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not token:
             return JSONResponse({"error": "Missing authorization"}, status_code=401)
         
-        user_id = validate_token(token, self.secret_key)
-        if not user_id:
+        namespace = validate_token(token, self.secret_key)
+        if not namespace:
             return JSONResponse({"error": "Invalid token"}, status_code=401)
         
-        user_ctx.set(user_id)
+        namespace_ctx.set(namespace)
         return await call_next(request)
 
 # Add to FastMCP's underlying Starlette app
@@ -270,7 +270,7 @@ from dataclasses import dataclass
 
 @dataclass
 class ExtractionJob:
-    user_id: str
+    namespace: str
     messages: list[dict]
     idempotency_key: str
     retries: int = 0
@@ -362,7 +362,7 @@ WITH (m = 16, ef_construction = 64);
 -- Query
 SELECT id, text, 1 - (embedding <=> $1::vector) AS similarity
 FROM memories
-WHERE user_id = $2
+WHERE namespace = $2
 ORDER BY embedding <=> $1::vector
 LIMIT 20;
 ```
@@ -393,12 +393,12 @@ def reciprocal_rank_fusion(
 
 
 async def hybrid_search(
-    user_id: str,
+    namespace: str,
     query: str,
     limit: int = 10,
     threshold: float = 0.65,
 ) -> list[Memory]:
-    memories = await db_get_memories(user_id)
+    memories = await db_get_memories(namespace)
     if not memories:
         return []
     
@@ -411,7 +411,7 @@ async def hybrid_search(
     # Dense (optional — only when embeddings exist)
     dense_ranked = []
     if has_embeddings(memories):
-        dense_ranked = await vector_search(user_id, query, limit=limit*3)
+        dense_ranked = await vector_search(namespace, query, limit=limit*3)
     
     # Fuse
     lists = [bm25_ranked]
@@ -452,7 +452,7 @@ def create_admin_app() -> FastAPI:
     app.mount("/admin", StaticFiles(directory=static_dir, html=True), name="admin")
     
     @app.get("/admin/api/memories")
-    async def get_memories(user_id: str, limit: int = 50, offset: int = 0):
+    async def get_memories(namespace: str, limit: int = 50, offset: int = 0):
         ...
     
     return app
